@@ -43,7 +43,9 @@ class ChatNode:
 
     def __init__(self, storage: str = "lora_chat_id"):
         # Start Reticulum (reads ~/.reticulum/config)
-        self.rns = RNS.Reticulum(configdir=os.path.expanduser("~/.reticulum"))
+        self.rns = RNS.Reticulum(configdir=os.path.expanduser("~/dev/RadioGram/.reticulum"))
+        print("[i] RNS config dir:", self.rns.configdir)
+
         self.identity = load_or_create_identity(storage)
 
         # INBOUND destination where we receive packets
