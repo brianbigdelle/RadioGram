@@ -1,54 +1,70 @@
 #!/usr/bin/env python3
-import argparse, os, sys, time, threading
+"""
+LoRa Chat — Simple Reticulum-based peer-to-peer messenger
+Compatible with Reticulum v1.0.0 and LILYGO LoRa32 (ESP32, 915 MHz)
+Author: Brian Bigdelle
+"""
+
+import argparse
+import os
+import time
+import threading
 import RNS
 
+
 APP_NAME = "lora_chat"
-DEST_FAMILY = ["apps", APP_NAME, "simple"]  # name components
+DEST_FAMILY = ["apps", APP_NAME, "simple"]
+
 
 def load_or_create_identity(path):
     if os.path.exists(path):
         try:
             return RNS.Identity.from_file(path)
         except Exception:
-            print(f"[!] Failed loading identity {path}, creating new one…")
+            print(f"[!] Failed to load identity at {path}, creating a new one…")
     ident = RNS.Identity()
     ident.to_file(path)
     return ident
 
+
 class ChatNode:
+    """Simple peer-to-peer chat node using Reticulum 1.0+"""
+
     def __init__(self, storage="lora_chat_id"):
-        # Start Reticulum (reads ~/.reticulum/config -> LoRa RNodeInterface)
+        # Start Reticulum (reads ~/.reticulum/config)
         self.rns = RNS.Reticulum()
         self.identity = load_or_create_identity(storage)
-        # IN destination for receiving
+
+        # Create destination for incoming packets
         self.rx_dest = RNS.Destination(
             self.identity,
             RNS.Destination.IN,
             RNS.Destination.SINGLE,
-            *DEST_FAMILY
+            *DEST_FAMILY,
         )
-        self.rx_dest.set_default_app_data_callback(self._on_packet)
-        self.rx_dest.register_link_established_callback(self._on_link_established)
-        self.rx_dest.register_link_closed_callback(self._on_link_closed)
+
+        # Register the packet receive callback (correct for Reticulum 1.0)
+        self.rx_dest.set_packet_callback(self._on_packet)
 
         self.link = None
         self.peer_hash = None
+
+    # ------------------------------------------------------------
 
     def address(self):
         return RNS.hexrep(self.rx_dest.hash, delimit=False)
 
     def announce(self):
-        # Make ourselves discoverable
         self.rx_dest.announce()
 
-    # When we *send*, we need an OUT destination bound to the peer’s hash
+    # ------------------------------------------------------------
+
     def _out_dest_for_peer(self, peer_hash_bytes):
-        # Create a temporary OUT destination with the peer’s hash
         out = RNS.Destination(
-            None,  # identity is unknown for peer
+            None,
             RNS.Destination.OUT,
             RNS.Destination.SINGLE,
-            *DEST_FAMILY
+            *DEST_FAMILY,
         )
         out.hash = peer_hash_bytes
         return out
@@ -62,32 +78,26 @@ class ChatNode:
 
         out_dest = self._out_dest_for_peer(self.peer_hash)
         self.link = RNS.Link(out_dest)
-        # Optionally wait for link establishment (or just send best-effort packets)
-        t0 = time.time()
-        while not (self.link and self.link.established):
-            if time.time() - t0 > 8:
-                break
-            time.sleep(0.05)
-        if self.link and self.link.established:
-            print("[✓] Link established")
-            return True
-        else:
-            print("[i] Link not established yet; will send as best-effort packets.")
-            return True
+        self.link.set_link_established_callback(self._on_link_established)
+        self.link.set_link_closed_callback(self._on_link_closed)
+
+        print("[i] Attempting to establish link…")
+        return True
 
     def send_text(self, text):
         data = text.encode("utf-8", errors="replace")
-        if self.link and self.link.established:
+
+        if self.link and self.link.status == RNS.Link.ACTIVE:
             try:
                 self.link.send(data)
                 return
             except Exception as e:
                 print(f"[!] Link send failed: {e}")
 
-        # Fall back to direct packet (no link reliability/ordering)
         if self.peer_hash is None:
             print("[!] No peer set. Use :connect <peer_hex> first.")
             return
+
         out_dest = self._out_dest_for_peer(self.peer_hash)
         try:
             pkt = RNS.Packet(out_dest, data)
@@ -95,8 +105,9 @@ class ChatNode:
         except Exception as e:
             print(f"[!] Packet send failed: {e}")
 
-    # ---- Callbacks ----
-    def _on_packet(self, dest, data, context):
+    # ------------------------------------------------------------
+
+    def _on_packet(self, dest, data):
         try:
             text = data.decode("utf-8", errors="replace")
         except Exception:
@@ -105,23 +116,29 @@ class ChatNode:
         print("> ", end="", flush=True)
 
     def _on_link_established(self, link):
-        print("[✓] Incoming link established")
+        print("[✓] Link established")
 
     def _on_link_closed(self, link):
         print("[i] Link closed")
 
+
+# -----------------------------------------------------------------
+
 def reader_thread(chat):
-    print("Type messages and press Enter. Commands:")
-    print("  :me                  -> show my address")
-    print("  :announce            -> (re)announce my address")
-    print("  :connect <peer_hex>  -> set peer and open link")
-    print("  :quit                -> exit")
-    print("")
+    print(
+        "Type messages and press Enter.\n"
+        "Commands:\n"
+        "  :me                  -> show my address\n"
+        "  :announce            -> broadcast my presence\n"
+        "  :connect <peer_hex>  -> set peer and open link\n"
+        "  :quit                -> exit\n"
+    )
     while True:
         try:
             line = input("> ").strip()
         except (EOFError, KeyboardInterrupt):
             break
+
         if not line:
             continue
         if line == ":quit":
@@ -137,28 +154,30 @@ def reader_thread(chat):
         else:
             chat.send_text(line)
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Tiny LoRa chat over Reticulum")
+    parser = argparse.ArgumentParser(description="Tiny LoRa Chat over Reticulum")
     parser.add_argument("--idfile", default="lora_chat_id", help="Identity file path")
-    parser.add_argument("--announce", action="store_true", help="Announce on start")
+    parser.add_argument("--announce", action="store_true", help="Announce on startup")
     args = parser.parse_args()
 
     chat = ChatNode(storage=args.idfile)
-
     print("Tiny LoRa Chat")
     print(f"Your address: {chat.address()}")
+
     if args.announce:
         chat.announce()
         print("[→] Announce sent")
 
     t = threading.Thread(target=reader_thread, args=(chat,), daemon=False)
     t.start()
-    # Keep Reticulum alive
+
     try:
         while t.is_alive():
             time.sleep(0.2)
     except KeyboardInterrupt:
         pass
+
 
 if __name__ == "__main__":
     main()
