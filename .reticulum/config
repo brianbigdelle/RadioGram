@@ -1,0 +1,25 @@
+# ~/.reticulum/config
+
+[Reticulum]
+  # Keep it simple; no Wi-Fi/Ethernet auto-bridges.
+  interfaces_default = no
+  panic_on_interface_error = yes
+  enable_transport = yes
+
+[[LoRa 915 Chat]]
+  type = RNodeInterface
+  enabled = yes
+  # macOS serial device for your LILYGO. Use the appropriate one on each Mac:
+  # e.g. /dev/cu.SLAB_USBtoUART  or  /dev/cu.usbserial-1410  (ls /dev/cu.* to find it)
+  port = /dev/cu.usbserial-58DD0138651
+
+  # PHY (must match both sides; LoRa-only)
+  frequency = 915000000
+  bandwidth = 125000
+  spreadingfactor = 9
+  codingrate = 5
+  txpower = 14
+
+  # Optional: keep these commented unless you need them
+  # id_interval = 720
+  # announce = yes
