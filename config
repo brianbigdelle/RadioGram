@@ -1,0 +1,20 @@
+[reticulum]
+enable_transport = yes
+share_instance = no
+panic_on_interface_error = yes
+
+[logging]
+loglevel = 3        # 0=FATAL, 1=CRITICAL, 2=ERROR, 3=WARNING, 4=INFO, 5+, noisy
+logfile = rns.log   # send logs to file instead of your console
+
+[interfaces]
+  [[LoRa-915-A]]
+  type = RNodeInterface
+  enabled = yes
+  port = /dev/cu.usbserial-58DD0138651
+  frequency = 915000000
+  bandwidth = 125000
+  spreadingfactor = 9
+  codingrate = 5
+  txpower = 0
+
