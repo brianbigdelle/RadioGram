@@ -16,6 +16,11 @@ import os
 import time
 import threading
 import RNS
+from typing import Optional
+import struct
+import serial
+import queue
+
 
 
 APP_NAME = "lora_chat"
@@ -38,13 +43,157 @@ def load_or_create_identity(path: str) -> RNS.Identity:
     return ident
 
 
+
+class InkplateBridge:
+    """
+    Bidirectional serial bridge for Inkplate.
+      - Host -> Inkplate:  b"TXTP" + uint16_le + utf8
+      - Inkplate -> Host:  b"SEND" + uint16_le + utf8
+    """
+    def __init__(self, port: str, baud: int = 115200):
+        self.port = os.path.expanduser(port)
+        self.baud = baud
+        self._q = queue.Queue(maxsize=100)
+        self._stop = False
+        self._on_text = None    # set via set_on_text(cb: Callable[[str], None])
+
+        # TX and RX background threads
+        self._tx_t = threading.Thread(target=self._tx_worker, daemon=True)
+        self._rx_t = threading.Thread(target=self._rx_worker, daemon=True)
+        self._tx_t.start()
+        self._rx_t.start()
+
+    def set_on_text(self, cb):
+        """Register callback to receive text from Inkplate (from 'SEND' frames)."""
+        self._on_text = cb
+
+    # ------------ public API ------------
+    def send(self, text: str):
+        """Queue text to show on Inkplate (TXTP). Non-blocking."""
+        try:
+            self._q.put_nowait(text)
+        except queue.Full:
+            try: self._q.get_nowait()
+            except queue.Empty: pass
+            self._q.put_nowait(text)
+
+    def close(self):
+        self._stop = True
+        for t in (self._tx_t, self._rx_t):
+            try: t.join(timeout=1.0)
+            except Exception: pass
+
+    # ------------ internals -------------
+    def _open(self):
+        ser = serial.Serial(
+            self.port, self.baud,
+            timeout=0.2, write_timeout=3,
+            rtscts=False, dsrdtr=False, xonxoff=False
+        )
+        try:
+            ser.setDTR(False); ser.setRTS(False)
+            ser.reset_input_buffer(); ser.reset_output_buffer()
+        except Exception:
+            pass
+        return ser
+
+    def _read_exact(self, ser, n, to=5.0):
+        buf = bytearray()
+        t0 = time.time()
+        while len(buf) < n and not self._stop:
+            b = ser.read(n - len(buf))
+            if b:
+                buf += b
+            elif time.time() - t0 > to:
+                return None
+        return bytes(buf)
+
+    def _tx_worker(self):
+        ser = None
+        last_err = 0
+        while not self._stop:
+            try:
+                if ser is None or not ser.is_open:
+                    ser = self._open()
+                try:
+                    msg = self._q.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                data = msg.encode("utf-8")[:60000]
+                frame = b"TXTP" + struct.pack("<H", len(data)) + data
+                ser.write(frame); ser.flush()
+            except Exception as e:
+                if time.time() - last_err > 2:
+                    print(f"[inkplate] TX error: {e}")
+                    last_err = time.time()
+                try:
+                    if ser: ser.close()
+                except Exception:
+                    pass
+                ser = None
+                time.sleep(0.4)
+        try:
+            if ser: ser.close()
+        except Exception:
+            pass
+
+    def _rx_worker(self):
+        ser = None
+        while not self._stop:
+            try:
+                if ser is None or not ser.is_open:
+                    ser = self._open()
+
+                # Look for "SEND" header
+                hdr = self._read_exact(ser, 4)
+                if hdr is None:
+                    continue
+                if hdr != b"SEND":
+                    # not our frame; try to resync by skipping a byte
+                    continue
+
+                ln = self._read_exact(ser, 2)
+                if ln is None:
+                    continue
+                L = ln[0] | (ln[1] << 8)
+                if L == 0 or L > 60000:
+                    continue
+                data = self._read_exact(ser, L)
+                if data is None:
+                    continue
+
+                text = data.decode("utf-8", errors="replace")
+                if self._on_text:
+                    try:
+                        self._on_text(text)
+                    except Exception as e:
+                        print(f"[inkplate] on_text callback error: {e}")
+
+            except Exception as e:
+                print(f"[inkplate] RX error: {e}")
+                try:
+                    if ser: ser.close()
+                except Exception:
+                    pass
+                ser = None
+                time.sleep(0.4)
+        try:
+            if ser: ser.close()
+        except Exception:
+            pass
+
 class ChatNode:
     """Simple peer-to-peer chat node for Reticulum 1.0+."""
 
-    def __init__(self, storage: str = "lora_chat_id"):
-        # Start Reticulum (reads ~/.reticulum/config)
-        self.rns = RNS.Reticulum(configdir=os.path.expanduser("~/dev/RadioGram/.reticulum"))
+    def __init__(self, storage: str, configdir: str, inkplate: Optional[InkplateBridge] = None):
+        # honor --configdir
+        cfg = os.path.expanduser(configdir)
+        if os.path.basename(cfg) == "config":
+            cfg = os.path.dirname(cfg)
+        self.rns = RNS.Reticulum(configdir=cfg)
         print("[i] RNS config dir:", self.rns.configdir)
+
+        self.inkplate = inkplate
 
         self.identity = load_or_create_identity(storage)
 
@@ -58,6 +207,12 @@ class ChatNode:
 
         # In RNS 1.0 the destination packet callback signature is (data, packet)
         self.rx_dest.set_packet_callback(self._on_packet)
+        # When a peer connects to us, Reticulum creates an incoming Link.
+        # Attach our callbacks to it so we can receive link packets.
+        try:
+            self.rx_dest.set_link_established_callback(self._on_incoming_link_established)
+        except Exception:
+            pass
 
         # Optional: automatically prove reception for senders that request it
         try:
@@ -66,8 +221,9 @@ class ChatNode:
             # Older builds may not support set_proof_strategy; safe to ignore
             pass
 
-        self.link = None         # type: RNS.Link | None
-        self.peer_hash = None    # type: bytes | None
+    
+        self.link: Optional[RNS.Link] = None
+        self.peer_hash: Optional[bytes] = None
 
     # ------------------------------------------------------------------
 
@@ -81,7 +237,7 @@ class ChatNode:
 
     # ------------------------------------------------------------------
 
-    def _wait_for_path_and_identity(self, peer_hash: bytes) -> RNS.Identity or None:
+    def _wait_for_path_and_identity(self, peer_hash: bytes) -> Optional[RNS.Identity]:
         """
         Ensure we have a route to the peer and have recalled its Identity.
         Returns the peer Identity or None if unavailable within timeout.
@@ -157,13 +313,14 @@ class ChatNode:
         """Send a message; prefer the Link if active, else best-effort packet."""
         data = text.encode("utf-8", errors="replace")
 
-        # If we have an active link, use it for reliability/ordering
+        # If we have an active link, send a Packet addressed to the Link
         if self.link and getattr(self.link, "status", None) == RNS.Link.ACTIVE:
             try:
-                self.link.send(data)
+                pkt = RNS.Packet(self.link, data)  # destination can be a Link
+                pkt.send()
                 return
             except Exception as e:
-                print(f"[!] Link send failed: {e}")
+                print(f"[!] Link packet send failed: {e}")
 
         # Fallback to direct packet (no link)
         if self.peer_hash is None:
@@ -181,29 +338,106 @@ class ChatNode:
     # Callbacks (RNS 1.0 signatures)
     # ------------------------------------------------------------------
 
+    def _on_incoming_link_established(self, link: RNS.Link) -> None:
+        # Track stats and attach the same packet/closed handlers
+        try:
+            link.track_phy_stats(True)
+            link.set_packet_callback(self._on_link_packet)
+            link.set_link_closed_callback(self._on_link_closed)
+        except Exception:
+            pass
+        # Optionally remember it so :rssi works on the receiver too
+        self.link = link
+        print("[✓] Incoming link established")
+
+
+
+    def _fmt_phy(self, packet) -> str:
+        """Return 'RSSI -xx.x dBm | SNR yy.y dB' or '' if unavailable."""
+        rssi = None
+        snr  = None
+        try:
+            rssi = packet.get_rssi()    # dBm (float) or None
+        except Exception:
+            pass
+        try:
+            snr = packet.get_snr()      # dB (float) or None
+        except Exception:
+            pass
+
+        parts = []
+        if rssi is not None:
+            parts.append(f"RSSI {rssi:.1f} dBm")
+        if snr is not None:
+            parts.append(f"SNR {snr:.1f} dB")
+        return " | ".join(parts) if parts else ""
+
     def _on_packet(self, data: bytes, packet: RNS.Packet) -> None:
-        """Incoming packets addressed to our IN destination (not necessarily over a Link)."""
         try:
             text = data.decode("utf-8", errors="replace")
         except Exception:
             text = str(data)
-        print(f"\n[←] {text}")
+        phy = self._fmt_phy(packet)
+        suffix = f"   ({phy})" if phy else ""
+        print(f"\n[←] {text}{suffix}")
+        # NEW: mirror to Inkplate
+        if self.inkplate:
+            try:
+                self.inkplate.send(text)
+            except Exception:
+                pass
         print("> ", end="", flush=True)
 
     def _on_link_packet(self, data: bytes, packet: RNS.Packet) -> None:
-        """Incoming packets arriving over an established Link."""
         try:
             text = data.decode("utf-8", errors="replace")
         except Exception:
             text = str(data)
-        print(f"\n[← link] {text}")
+        phy = self._fmt_phy(packet)
+        suffix = f"   ({phy})" if phy else ""
+        print(f"\n[← link] {text}{suffix}")
+        # NEW: mirror to Inkplate
+        if self.inkplate:
+            try:
+                self.inkplate.send(text)
+            except Exception:
+                pass
         print("> ", end="", flush=True)
 
+
+
     def _on_link_established(self, link: RNS.Link) -> None:
+        try:
+            link.track_phy_stats(True)   # enables link.get_rssi()/get_snr()
+        except Exception:
+            pass
         print("[✓] Link established")
 
     def _on_link_closed(self, link: RNS.Link) -> None:
         print("[i] Link closed")
+
+    # Optional: used by :rssi command
+    def print_link_stats(self):
+        if not self.link or getattr(self.link, "status", None) != RNS.Link.ACTIVE:
+            print("[i] No active link")
+            return
+        rssi = None
+        snr  = None
+        try:
+            rssi = self.link.get_rssi()
+        except Exception:
+            pass
+        try:
+            snr = self.link.get_snr()
+        except Exception:
+            pass
+        if rssi is None and snr is None:
+            print("[i] PHY stats unavailable on this interface")
+        else:
+            parts = []
+            if rssi is not None: parts.append(f"RSSI {rssi:.1f} dBm")
+            if snr  is not None: parts.append(f"SNR {snr:.1f} dB")
+            print("[link] " + " | ".join(parts))
 
 
 # ----------------------------------------------------------------------
@@ -215,6 +449,7 @@ def reader_thread(chat: ChatNode) -> None:
         "  :me                  -> show my address\n"
         "  :announce            -> broadcast my presence\n"
         "  :connect <peer_hex>  -> set peer and open link\n"
+        "  :rssi                -> show current link RSSI/SNR (if available)\n"
         "  :quit                -> exit\n"
     )
     while True:
@@ -229,6 +464,8 @@ def reader_thread(chat: ChatNode) -> None:
             break
         elif line == ":me":
             print(f"[you] {chat.address()}")
+        elif line == ":rssi":
+            chat.print_link_stats()
         elif line == ":announce":
             chat.announce()
             print("[→] Announce sent")
@@ -243,9 +480,35 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Tiny LoRa Chat over Reticulum")
     parser.add_argument("--idfile", default="lora_chat_id", help="Identity file path")
     parser.add_argument("--announce", action="store_true", help="Announce on startup")
+    parser.add_argument(
+        "--configdir",
+        default=os.path.expanduser("~/dev/RadioGram_bb"),
+        help="Reticulum config directory",
+
+    )
+    parser.add_argument(
+    "--inkplate-port",
+    default=None,
+    help="Serial port to an Inkplate (e.g., /dev/ttyACM0 or /dev/cu.usbmodemXYZ). If set, received messages are mirrored to the e-paper.",
+    )
+
+
     args = parser.parse_args()
 
-    chat = ChatNode(storage=args.idfile)
+    ink = None
+    if args.inkplate_port:
+        ink = InkplateBridge(args.inkplate_port)
+
+    chat = ChatNode(storage=args.idfile, configdir=args.configdir, inkplate=ink)
+
+    # NEW: when Inkplate sends "SEND …", forward it over Reticulum
+    if ink:
+        def _from_inkplate_to_radio(s: str):
+            print(f"[inkplate->radio] {s}")
+            chat.send_text(s)
+        ink.set_on_text(_from_inkplate_to_radio)
+
+
     print("Tiny LoRa Chat")
     print(f"Your address: {chat.address()}")
 
@@ -261,6 +524,11 @@ def main() -> None:
             time.sleep(0.2)
     except KeyboardInterrupt:
         pass
+
+    finally:
+        if ink:
+            ink.close()
+
 
 
 if __name__ == "__main__":
